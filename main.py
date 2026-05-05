@@ -20,7 +20,7 @@ data_dir = '../Dataset/COCO'
 
 def train(args, params):
     # Model
-    model = nn.yolo_v11_n(len(params['names']))
+    model = nn.build_model(args.model, len(params['names']))
     model.cuda()
 
     # Optimizer
@@ -242,7 +242,7 @@ def test(args, params, model=None):
 def profile(args, params):
     import thop
     shape = (1, 3, args.input_size, args.input_size)
-    model = nn.yolo_v11_n(len(params['names'])).fuse()
+    model = nn.build_model(args.model, len(params['names'])).fuse()
 
     model.eval()
     model(torch.zeros(shape))
@@ -263,6 +263,8 @@ def main():
     parser.add_argument('--local-rank', default=0, type=int)
     parser.add_argument('--local_rank', default=0, type=int)
     parser.add_argument('--epochs', default=600, type=int)
+    parser.add_argument('--model', default='yolo_v11_n', type=str,
+                        help='Model: yolo_v11_n/s/m/l/x, hierlight_yolo_n/s/m')
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--test', action='store_true')
 

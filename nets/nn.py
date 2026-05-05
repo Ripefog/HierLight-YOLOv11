@@ -49,6 +49,48 @@ class Residual(torch.nn.Module):
         return x + self.conv2(self.conv1(x))
 
 
+class IRDCB(torch.nn.Module):
+    # Inverted Residual Depthwise Convolution Block
+    # arXiv:2509.22365 - HierLight-YOLO
+    def __init__(self, in_ch, out_ch, t=2):
+        super().__init__()
+        c_exp = int(in_ch * t)
+        self.expand = Conv(in_ch, c_exp, torch.nn.SiLU())
+        self.dw1 = Conv(c_exp, c_exp, torch.nn.SiLU(), k=3, p=1, g=c_exp)
+        self.dw2 = Conv(c_exp, c_exp, torch.nn.SiLU(), k=3, p=1, g=c_exp)
+        self.compress = Conv(c_exp, out_ch, torch.nn.SiLU())
+        self.residual = (in_ch == out_ch)
+
+    def forward(self, x):
+        y = self.compress(self.dw2(self.dw1(self.expand(x))))
+        return x + y if self.residual else y
+
+
+class LDown(torch.nn.Module):
+    # Lightweight Downsample module
+    # arXiv:2509.22365 - HierLight-YOLO
+    def __init__(self, in_ch, out_ch, k=3, s=2):
+        super().__init__()
+        p = k // 2
+        self.dw = torch.nn.Conv2d(in_ch, in_ch, k, s, p, groups=in_ch, bias=False)
+        self.dw_norm = torch.nn.BatchNorm2d(in_ch, eps=0.001, momentum=0.03)
+        self.conv = Conv(in_ch, out_ch, torch.nn.SiLU())
+
+    def forward(self, x):
+        return self.conv(self.dw_norm(self.dw(x)))
+
+
+class HFCC(torch.nn.Module):
+    # Hierarchical Feature Channel Compression
+    # arXiv:2509.22365 - HierLight-YOLO
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv = Conv(in_ch, out_ch, torch.nn.SiLU())
+
+    def forward(self, x):
+        return self.conv(x)
+
+
 class CSPModule(torch.nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
@@ -209,6 +251,50 @@ class DarkFPN(torch.nn.Module):
         return p3, p4, p5
 
 
+class HEPAN(torch.nn.Module):
+    # Hierarchical Extended Path Aggregation Network
+    # arXiv:2509.22365 - HierLight-YOLO
+    def __init__(self, width, n):
+        super().__init__()
+        self.up = torch.nn.Upsample(scale_factor=2)
+
+        # HFCC at backbone outputs P2-P5
+        self.hfcc2 = HFCC(width[3], width[3])
+        self.hfcc3 = HFCC(width[4], width[3])
+        self.hfcc4 = HFCC(width[4], width[3])
+        self.hfcc5 = HFCC(width[5], width[3])
+
+        # Top-down path (P5→P4→P3→P2)
+        self.td4 = torch.nn.Sequential(*(IRDCB(width[3] * 2, width[3]) for _ in range(n)))
+        self.td3 = torch.nn.Sequential(*(IRDCB(width[3] * 2, width[3]) for _ in range(n)))
+        self.td2 = torch.nn.Sequential(*(IRDCB(width[3] * 2, width[3]) for _ in range(n)))
+
+        # Bottom-up path (P2→P3→P4→P5)
+        self.down_bu3 = LDown(width[3], width[3])
+        self.bu3 = torch.nn.Sequential(*(IRDCB(width[3] * 2, width[3]) for _ in range(n)))
+        self.down_bu4 = LDown(width[3], width[3])
+        self.bu4 = torch.nn.Sequential(*(IRDCB(width[3] * 2, width[3]) for _ in range(n)))
+        self.down_bu5 = LDown(width[3], width[3])
+        self.bu5 = torch.nn.Sequential(*(IRDCB(width[3] * 2, width[3]) for _ in range(n)))
+
+    def forward(self, x):
+        p2, p3, p4, p5 = x
+        # HFCC compression
+        p2c = self.hfcc2(p2)
+        p3c = self.hfcc3(p3)
+        p4c = self.hfcc4(p4)
+        p5c = self.hfcc5(p5)
+        # Top-down (P5→P4→P3→P2)
+        n4 = self.td4(torch.cat([self.up(p5c), p4c], dim=1))
+        n3 = self.td3(torch.cat([self.up(n4), p3c], dim=1))
+        n2 = self.td2(torch.cat([self.up(n3), p2c], dim=1))
+        # Bottom-up (P2→P3→P4→P5) with dense skip connections
+        f3 = self.bu3(torch.cat([self.down_bu3(n2), n3], dim=1))
+        f4 = self.bu4(torch.cat([self.down_bu4(f3), n4], dim=1))
+        f5 = self.bu5(torch.cat([self.down_bu5(f4), p5c], dim=1))
+        return n2, f3, f4, f5
+
+
 class DFL(torch.nn.Module):
     # Generalized Focal Loss
     # https://ieeexplore.ieee.org/document/9792391
@@ -345,3 +431,122 @@ def yolo_v11_x(num_classes: int = 80):
     depth = [2, 2, 2, 2, 2, 2]
     width = [3, 96, 192, 384, 768, 768]
     return YOLO(width, depth, csp, num_classes)
+
+
+class HierLightBackbone(torch.nn.Module):
+    # Backbone using LDown + IRDCB, outputs P2-P5
+    # arXiv:2509.22365 - HierLight-YOLO
+    def __init__(self, width, depth):
+        super().__init__()
+        self.p1 = []
+        self.p2 = []
+        self.p3 = []
+        self.p4 = []
+        self.p5 = []
+
+        # p1/2
+        self.p1.append(Conv(width[0], width[1], torch.nn.SiLU(), k=3, s=2, p=1))
+        # p2/4
+        self.p2.append(LDown(width[1], width[2]))
+        self.p2.append(IRDCB(width[2], width[3]))
+        for _ in range(depth[0] - 1):
+            self.p2.append(IRDCB(width[3], width[3]))
+        # p3/8
+        self.p3.append(LDown(width[3], width[3]))
+        self.p3.append(IRDCB(width[3], width[4]))
+        for _ in range(depth[1] - 1):
+            self.p3.append(IRDCB(width[4], width[4]))
+        # p4/16
+        self.p4.append(LDown(width[4], width[4]))
+        for _ in range(depth[2]):
+            self.p4.append(IRDCB(width[4], width[4]))
+        # p5/32
+        self.p5.append(LDown(width[4], width[5]))
+        for _ in range(depth[3]):
+            self.p5.append(IRDCB(width[5], width[5]))
+        self.p5.append(SPP(width[5], width[5]))
+
+        self.p1 = torch.nn.Sequential(*self.p1)
+        self.p2 = torch.nn.Sequential(*self.p2)
+        self.p3 = torch.nn.Sequential(*self.p3)
+        self.p4 = torch.nn.Sequential(*self.p4)
+        self.p5 = torch.nn.Sequential(*self.p5)
+
+    def forward(self, x):
+        p1 = self.p1(x)
+        p2 = self.p2(p1)
+        p3 = self.p3(p2)
+        p4 = self.p4(p3)
+        p5 = self.p5(p4)
+        return p2, p3, p4, p5
+
+
+class HierLightHead(Head):
+    # 4-scale detection head for HierLight-YOLO (P2, P3, P4, P5)
+    # arXiv:2509.22365 - HierLight-YOLO
+    def __init__(self, nc=80, filters=()):
+        super().__init__(nc, filters)
+
+
+class HierLightYOLO(torch.nn.Module):
+    # arXiv:2509.22365 - HierLight-YOLO
+    def __init__(self, width, depth, num_classes):
+        super().__init__()
+        self.net = HierLightBackbone(width, depth)
+        self.fpn = HEPAN(width, depth[4])
+
+        img_dummy = torch.zeros(1, width[0], 256, 256)
+        self.head = HierLightHead(num_classes, (width[3], width[3], width[3], width[3]))
+        self.head.stride = torch.tensor([256 / x.shape[-2] for x in self.forward(img_dummy)])
+        self.stride = self.head.stride
+        self.head.initialize_biases()
+
+    def forward(self, x):
+        x = self.net(x)
+        x = self.fpn(x)
+        return self.head(list(x))
+
+    def fuse(self):
+        for m in self.modules():
+            if type(m) is Conv and hasattr(m, 'norm'):
+                m.conv = fuse_conv(m.conv, m.norm)
+                m.forward = m.fuse_forward
+                delattr(m, 'norm')
+        return self
+
+
+def hierlight_yolo_n(num_classes: int = 10):
+    depth = [1, 1, 1, 1, 1]
+    width = [3, 16, 32, 64, 128, 256]
+    return HierLightYOLO(width, depth, num_classes)
+
+
+def hierlight_yolo_s(num_classes: int = 10):
+    depth = [1, 1, 1, 1, 1]
+    width = [3, 32, 64, 128, 256, 512]
+    return HierLightYOLO(width, depth, num_classes)
+
+
+def hierlight_yolo_m(num_classes: int = 10):
+    depth = [2, 2, 2, 2, 1]
+    width = [3, 48, 96, 192, 384, 576]
+    return HierLightYOLO(width, depth, num_classes)
+
+
+MODEL_REGISTRY = {
+    'yolo_v11_n': yolo_v11_n,
+    'yolo_v11_t': yolo_v11_t,
+    'yolo_v11_s': yolo_v11_s,
+    'yolo_v11_m': yolo_v11_m,
+    'yolo_v11_l': yolo_v11_l,
+    'yolo_v11_x': yolo_v11_x,
+    'hierlight_yolo_n': hierlight_yolo_n,
+    'hierlight_yolo_s': hierlight_yolo_s,
+    'hierlight_yolo_m': hierlight_yolo_m,
+}
+
+
+def build_model(name, num_classes):
+    if name not in MODEL_REGISTRY:
+        raise ValueError(f'Unknown model: {name}. Available: {list(MODEL_REGISTRY.keys())}')
+    return MODEL_REGISTRY[name](num_classes)
